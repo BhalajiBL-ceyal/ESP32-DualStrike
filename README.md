@@ -1,6 +1,7 @@
 # ESP32 Dual-Node Wi-Fi Pen-Tool
 
 Inspired by [risinek/esp32-wifi-penetration-tool](https://github.com/risinek/esp32-wifi-penetration-tool), but redesigned for **two ESP32s** connected by **ESP-NOW** to solve the fundamental problem of the single-board design:
+<img width="1915" height="967" alt="image" src="https://github.com/user-attachments/assets/ee2bac00-d1ca-4c5c-b593-3b2dedcece8a" />
 
 > 🚨 When the ESP32 enters **monitor/promiscuous mode** it can no longer run an Access Point or WebServer — the radio is fully consumed by packet sniffing.  
 > The dual-node design splits responsibilities so **both functions work simultaneously**.
@@ -167,4 +168,5 @@ aircrack-ng handshake.cap -w wordlist.txt
 > ⚠️ **For educational and authorised penetration testing ONLY.**  
 > Using these tools on networks you do not own or have **explicit written permission** to test is illegal in most jurisdictions and may result in criminal prosecution.  
 > The author accepts no liability for misuse.
+
 
