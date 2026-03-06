@@ -1,0 +1,3 @@
+https://arxiv.org/pdf/1904.13071
+https://github.com/hegusung/WebHashcat
+https://github.com/praetorian-inc/hashcatJS

@@ -1,0 +1,524 @@
+/**
+ * ESP32 NODE 1 — Web Gateway & Security Suite UI
+ * - Hosts Wi-Fi AP "ESP32-WebTerm" on 192.168.4.1
+ * - Serves full tabbed Security Suite web UI on port 80
+ * - WebSocket server on port 81 (real-time terminal)
+ * - Bridges all browser commands → ESP2 via ESP-NOW
+ * - ESP2_MAC: paste Node 2's MAC address here
+ *
+ * Library needed: WebSockets by Markus Sattler
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+// ─── CONFIGURE: paste ESP2 MAC here (from esp2 Serial Monitor)
+uint8_t ESP2_MAC[] = {0x78, 0x21, 0x84, 0xE1, 0x76, 0x10};
+
+const char* AP_SSID = "ESP32-WebTerm";
+const char* AP_PASS = "esp32admin";
+
+WebServer        httpServer(80);
+WebSocketsServer wsServer(81);
+
+#define QUEUE_SIZE 24
+#define MSG_LEN    250
+static char  msgQueue[QUEUE_SIZE][MSG_LEN];
+static int   qHead = 0, qTail = 0;
+static volatile bool queueOverflow = false;
+
+esp_now_peer_info_t peerInfo;
+
+// ═══════════════════════════════════════════════════════════
+//  HTML PAGE — Full Tabbed Security Suite UI
+// ═══════════════════════════════════════════════════════════
+const char HTML_PAGE[] = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>ESP32 Security Suite</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;700&display=swap');
+:root{--bg:#0d0f14;--surf:#161b22;--brd:#21262d;--green:#39d353;--cyan:#58a6ff;--yellow:#e3b341;--red:#f85149;--purple:#bc8cff;--orange:#ffa657;--muted:#8b949e;--text:#c9d1d9}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+header{display:flex;align-items:center;justify-content:space-between;padding:8px 18px;background:var(--surf);border-bottom:1px solid var(--brd);flex-shrink:0}
+.logo{display:flex;align-items:center;gap:10px;font-family:'JetBrains Mono',monospace;font-weight:700;font-size:.95rem;color:var(--green)}
+.li{width:28px;height:28px;background:linear-gradient(135deg,#39d353,#00b4d8);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px}
+.hr{display:flex;align-items:center;gap:10px;font-size:.71rem;color:var(--muted)}
+.wsd{width:8px;height:8px;border-radius:50%;background:var(--red);display:inline-block;margin-right:4px;transition:background .3s}
+.wsd.on{background:var(--green);animation:p 2s infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+.badge{padding:2px 7px;border-radius:99px;font-size:.67rem;font-weight:700;border:1px solid var(--brd);background:#21262d;color:var(--muted)}
+.badge.on{background:rgba(57,211,83,.12);color:var(--green);border-color:rgba(57,211,83,.4)}
+.tabs{display:flex;gap:2px;padding:5px 12px;background:var(--surf);border-bottom:1px solid var(--brd);overflow-x:auto;flex-shrink:0}
+.tabs::-webkit-scrollbar{height:3px}.tabs::-webkit-scrollbar-thumb{background:var(--brd)}
+.tb{padding:4px 12px;border-radius:6px;border:1px solid transparent;background:none;color:var(--muted);font-size:.72rem;font-family:'JetBrains Mono',monospace;cursor:pointer;white-space:nowrap;transition:all .15s}
+.tb:hover{background:var(--brd);color:var(--text)}.tb.act{background:rgba(88,166,255,.15);color:var(--cyan);border-color:rgba(88,166,255,.3)}
+.panels{flex-shrink:0}
+.panel{display:none;padding:9px 15px;background:var(--surf);border-bottom:1px solid var(--brd)}
+.panel.act{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+.lbl{font-size:.71rem;color:var(--muted);font-family:'JetBrains Mono',monospace;white-space:nowrap}
+.inp{padding:4px 9px;background:var(--bg);border:1px solid var(--brd);color:var(--text);border-radius:6px;font-size:.73rem;font-family:'JetBrains Mono',monospace}
+.inp:focus{outline:none;border-color:var(--cyan)}
+.btn{padding:4px 11px;border-radius:6px;border:1px solid var(--brd);background:var(--bg);color:var(--text);font-size:.72rem;font-family:'JetBrains Mono',monospace;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn:hover{background:var(--brd)}
+.g{border-color:rgba(57,211,83,.4);color:var(--green)}.g:hover{background:rgba(57,211,83,.12)}
+.r{border-color:rgba(248,81,73,.4);color:var(--red)}.r:hover{background:rgba(248,81,73,.12)}
+.b{border-color:rgba(88,166,255,.4);color:var(--cyan)}.b:hover{background:rgba(88,166,255,.12)}
+.y{border-color:rgba(227,179,65,.4);color:var(--yellow)}.y:hover{background:rgba(227,179,65,.12)}
+.pu{border-color:rgba(188,140,255,.4);color:var(--purple)}.pu:hover{background:rgba(188,140,255,.12)}
+.o{border-color:rgba(255,166,87,.4);color:var(--orange)}.o:hover{background:rgba(255,166,87,.12)}
+.sep{width:1px;height:18px;background:var(--brd);flex-shrink:0}
+#terminal{flex:1;overflow-y:auto;padding:12px 18px;font-family:'JetBrains Mono',monospace;font-size:.79rem;line-height:1.75;background:var(--bg)}
+#terminal::-webkit-scrollbar{width:5px}#terminal::-webkit-scrollbar-thumb{background:var(--brd);border-radius:3px}
+.ln{display:block;animation:fi .1s;white-space:pre-wrap;word-break:break-all}
+@keyframes fi{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}
+.sys{color:var(--cyan)}.inp-ln{color:var(--yellow)}.out{color:var(--green)}.err{color:var(--red)}.info{color:var(--muted)}.scan{color:var(--orange)}.hs{color:#ff7b72}.evil{color:#f78166}
+.cmd-row{display:flex;align-items:center;gap:8px;padding:9px 18px;background:var(--surf);border-top:1px solid var(--brd);flex-shrink:0}
+.prompt{color:var(--green);font-family:'JetBrains Mono',monospace;font-size:.85rem;user-select:none}
+#cmdInput{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:.85rem;caret-color:var(--green)}
+#cmdInput::placeholder{color:var(--muted);font-size:.78rem}
+#sendBtn{padding:6px 16px;background:linear-gradient(135deg,#39d353,#00b894);border:none;border-radius:6px;color:#000;font-weight:700;font-size:.78rem;cursor:pointer}
+#sendBtn:hover{opacity:.85}
+</style></head><body>
+
+<header>
+  <div class="logo"><div class="li">&#x25B6;</div>ESP32 SECURITY SUITE</div>
+  <div class="hr">
+    <span><span class="wsd" id="wsDot"></span><span id="wsLbl">Disconnected</span></span>
+    <span class="badge" id="monBadge">MON:OFF</span>
+    <span class="badge" id="deauthBadge">DEAUTH:OFF</span>
+    <span class="badge" id="evilBadge">EVIL:OFF</span>
+  </div>
+</header>
+
+<div class="tabs">
+  <button class="tb act" onclick="tab('monitor',this)">&#x1F4E1; Monitor</button>
+  <button class="tb" onclick="tab('deauth',this)">&#x26A1; Deauth</button>
+  <button class="tb" onclick="tab('beacon',this)">&#x1F4F6; Beacon</button>
+  <button class="tb" onclick="tab('evil',this)">&#x1F608; Evil Twin</button>
+  <button class="tb" onclick="tab('hs',this)">&#x1F91D; Handshake</button>
+  <button class="tb" onclick="tab('ps',this)">&#x1F50D; Port Scan</button>
+  <button class="tb" onclick="tab('wd',this)">&#x1F5FA; Wardrive</button>
+  <button class="tb" onclick="tab('sae',this)">&#x1F525; SAE Flood</button>
+  <button class="tb" onclick="tab('saq',this)">&#x1F6E1; SA-Query</button>
+  <button class="tb" onclick="tab('afl',this)">&#x1F4A5; Assoc Flood</button>
+</div>
+
+<div class="panels">
+  <div class="panel act" id="p-monitor">
+    <button class="btn g" onclick="send('monitor start')">&#x25B6; Start Monitor</button>
+    <button class="btn r" onclick="send('monitor stop')">&#x25A0; Stop Monitor</button>
+    <div class="sep"></div>
+    <span class="lbl">Ch:</span>
+    <select class="inp" id="monCh" style="width:60px">
+      <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+      <option selected>6</option><option>7</option><option>8</option><option>9</option>
+      <option>10</option><option>11</option><option>12</option><option>13</option>
+    </select>
+    <button class="btn b" onclick="send('channel '+v('monCh'))">Set Ch</button>
+    <div class="sep"></div>
+    <button class="btn" onclick="runScan()">&#x1F501; Scan APs</button>
+    <button class="btn" onclick="send('status')">&#x2139; Status</button>
+    <button class="btn" onclick="clearTerm()">&#x1F5D1; Clear</button>
+  </div>
+
+  <div class="panel" id="p-deauth">
+    <button class="btn b" onclick="runScan()">&#x1F501; Scan</button>
+    <select class="inp" id="apD" style="width:230px"><option value="">-- select AP --</option></select>
+    <span class="lbl">Client:</span>
+    <input class="inp" id="dCli" placeholder="FF:FF:FF:FF:FF:FF (all)" style="width:160px">
+    <div class="sep"></div>
+    <button class="btn g" onclick="startDeauth()">&#x26A1; Start Deauth</button>
+    <button class="btn r" onclick="send('deauth stop')">&#x25A0; Stop</button>
+  </div>
+
+  <div class="panel" id="p-beacon">
+    <button class="btn g" onclick="send('beacon start')">&#x25B6; Start Beacon Spam</button>
+    <button class="btn r" onclick="send('beacon stop')">&#x25A0; Stop</button>
+    <div class="sep"></div>
+    <span class="lbl" style="color:var(--orange)">Injects 15 fake SSIDs (FBI Van, SkyNet, etc.)</span>
+  </div>
+
+  <div class="panel" id="p-evil">
+    <button class="btn b" onclick="runScan()">&#x1F501; Scan</button>
+    <select class="inp" id="apE" style="width:200px"><option value="">-- select target --</option></select>
+    <span class="lbl">or SSID:</span>
+    <input class="inp" id="eSsid" placeholder="Target SSID" style="width:140px">
+    <div class="sep"></div>
+    <button class="btn o" onclick="startEvil()">&#x1F608; Launch Evil Twin</button>
+    <button class="btn r" onclick="send('eviltwin stop')">&#x25A0; Stop</button>
+  </div>
+
+  <div class="panel" id="p-hs">
+    <button class="btn b" onclick="runScan()">&#x1F501; Scan</button>
+    <select class="inp" id="apH" style="width:220px"><option value="">-- select AP --</option></select>
+    <div class="sep"></div>
+    <button class="btn g" onclick="startHs()">&#x25B6; Capture Handshake</button>
+    <button class="btn r" onclick="send('handshake stop')">&#x25A0; Stop</button>
+    <button class="btn y" id="dlBtn" onclick="send('handshake get')" disabled>&#x2B07; Download PCAP</button>
+    <span class="lbl" id="hsStatus" style="color:var(--green)">EAPOL: 0/4</span>
+  </div>
+
+  <div class="panel" id="p-ps">
+    <span class="lbl">Target IP:</span>
+    <input class="inp" id="psIp" placeholder="192.168.4.2" style="width:120px">
+    <span class="lbl">Ports:</span>
+    <input class="inp" id="psS" value="1" style="width:52px">
+    <span class="lbl">-</span>
+    <input class="inp" id="psE" value="1024" style="width:52px">
+    <button class="btn g" onclick="startPS()">&#x1F50D; Scan Ports</button>
+  </div>
+
+  <div class="panel" id="p-wd">
+    <button class="btn g" onclick="send('wardrive start')">&#x1F5FA; Start Wardriving</button>
+    <button class="btn r" onclick="send('wardrive stop')">&#x25A0; Stop</button>
+    <div class="sep"></div>
+    <span class="lbl">Cycles ch1-13 every 3s — logs all APs found</span>
+  </div>
+
+  <div class="panel" id="p-sae">
+    <button class="btn b" onclick="runScan()">&#x1F501; Scan</button>
+    <select class="inp" id="apS" style="width:220px"><option value="">-- select AP --</option></select>
+    <div class="sep"></div>
+    <button class="btn pu" onclick="startSae()">&#x1F525; Start SAE Flood</button>
+    <button class="btn r" onclick="send('sae stop')">&#x25A0; Stop</button>
+    <span class="lbl" style="color:var(--purple)">Targets WPA3 APs — SAE Commit exhaustion</span>
+  </div>
+
+  <div class="panel" id="p-saq">
+    <button class="btn b" onclick="runScan()">&#x1F501; Scan</button>
+    <select class="inp" id="apSQ" style="width:220px"><option value="">-- select AP --</option></select>
+    <div class="sep"></div>
+    <button class="btn pu" onclick="startSaQuery()">&#x1F6E1; Start SA-Query Flood</button>
+    <button class="btn r" onclick="send('saquery stop')">&#x25A0; Stop</button>
+    <span class="lbl" style="color:var(--purple)">Abuses PMF SA-Query — works on WPA2/WPA3</span>
+  </div>
+
+  <div class="panel" id="p-afl">
+    <button class="btn b" onclick="runScan()">&#x1F501; Scan</button>
+    <select class="inp" id="apAF" style="width:220px"><option value="">-- select AP --</option></select>
+    <div class="sep"></div>
+    <button class="btn o" onclick="startAssocFlood()">&#x1F4A5; Start Assoc Flood</button>
+    <button class="btn r" onclick="send('assocflood stop')">&#x25A0; Stop</button>
+    <span class="lbl" style="color:var(--orange)">Floods assoc responses — triggers self-deauth on buggy clients</span>
+  </div>
+</div>
+
+<div id="terminal"></div>
+
+<div class="cmd-row">
+  <span class="prompt">esp32&gt;&nbsp;</span>
+  <input id="cmdInput" type="text" placeholder="Type a command and press Enter (e.g. scan, monitor start, deauth AA:BB:CC:DD:EE:FF)..." autocomplete="off" spellcheck="false"/>
+  <button id="sendBtn" onclick="sendRaw()">Send</button>
+</div>
+
+<script>
+var ws, pcapChunks=[], pcapTotal=0, history=[], histIdx=-1, apList=[];
+function v(id){return document.getElementById(id).value;}
+function el(id){return document.getElementById(id);}
+
+function tab(id,btn){
+  document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('act');});
+  document.querySelectorAll('.tb').forEach(function(b){b.classList.remove('act');});
+  el('p-'+id).classList.add('act'); btn.classList.add('act');
+}
+function init(){
+  log('sys','╔═══════════════════════════════════════════╗');
+  log('sys','║    ESP32 Dual-Node Security Suite v2.0    ║');
+  log('sys','╚═══════════════════════════════════════════╝');
+  log('info','Commands: monitor start|stop, channel N, scan');
+  log('info','deauth <BSSID> [client], deauth stop');
+  log('info','beacon start|stop, eviltwin <SSID>, eviltwin stop');
+  log('info','handshake <BSSID>, handshake stop, handshake get');
+  log('info','sae <BSSID>, sae stop, wardrive start|stop, status');
+  log('info','portscan <IP> <startPort> <endPort>');
+  log('info','Connecting to WebSocket...');
+  connect();
+  el('cmdInput').addEventListener('keydown',function(e){
+    if(e.key==='Enter'){sendRaw();}
+    if(e.key==='ArrowUp'){e.preventDefault();histIdx=Math.min(histIdx+1,history.length-1);el('cmdInput').value=history[histIdx]||'';}
+    if(e.key==='ArrowDown'){e.preventDefault();histIdx=Math.max(histIdx-1,-1);el('cmdInput').value=histIdx<0?'':history[histIdx];}
+  });
+}
+function connect(){
+  ws=new WebSocket('ws://'+location.hostname+':81/');
+  ws.onopen=function(){setDot(true);log('sys','✔ WebSocket connected.');};
+  ws.onclose=function(){setDot(false);log('err','✖ Disconnected — reconnecting...');setTimeout(connect,3000);};
+  ws.onerror=function(){log('err','⚠ WebSocket error.');};
+  ws.onmessage=function(e){handleMsg(e.data);};
+}
+function handleMsg(raw){
+  if(raw.startsWith('[PCAP:START:')){
+    var m=raw.match(/\[PCAP:START:(\d+):(\d+)\]/);
+    if(m){pcapTotal=parseInt(m[1]);pcapChunks=[];log('hs','[PCAP] Receiving '+pcapTotal+' chunks...');}
+    return;
+  }
+  if(raw.startsWith('[PCAP:')&&raw!=='[PCAP:END]'){
+    var m=raw.match(/\[PCAP:(\d+)\/\d+:(.+)\]/);
+    if(m)pcapChunks[parseInt(m[1])]=m[2];
+    return;
+  }
+  if(raw==='[PCAP:END]'){buildPcap();return;}
+  if(raw.indexOf('Monitor Mode Started')>=0) setBadge('monBadge','MON:ON',true);
+  if(raw.indexOf('Monitor Mode Stopped')>=0) setBadge('monBadge','MON:OFF',false);
+  if(raw.indexOf('Deauth flood')>=0)          setBadge('deauthBadge','DEAUTH:ON',true);
+  if(raw.indexOf('Deauth stopped')>=0)        setBadge('deauthBadge','DEAUTH:OFF',false);
+  if(raw.indexOf('EvilTwin')>=0&&raw.indexOf('active')>=0) setBadge('evilBadge','EVIL:ON',true);
+  if(raw.indexOf('Evil Twin stopped')>=0)     setBadge('evilBadge','EVIL:OFF',false);
+  var hm=raw.match(/EAPOL frame #(\d+)/);
+  if(hm){el('hsStatus').textContent='EAPOL: '+hm[1]+'/4';}
+  if(raw.indexOf('4-way handshake complete')>=0){el('dlBtn').disabled=false;}
+  if(raw.startsWith('[Scan]')||raw.startsWith('[WD]')) populateAp(raw);
+  var cls='out';
+  if(raw.startsWith('[Scan]')||raw.startsWith('[WD]')||raw.startsWith('[Wardrive]'))cls='scan';
+  if(raw.startsWith('[Handshake]')||raw.startsWith('[PCAP]'))cls='hs';
+  if(raw.startsWith('[EvilTwin]')||raw.indexOf('CAPTURED')>=0)cls='evil';
+  if(raw.startsWith('[PortScan]'))cls='info';
+  if(raw.indexOf('ERROR')>=0||raw.startsWith('[Node2] FATAL'))cls='err';
+  if(raw.startsWith('[ESP1]'))cls='sys';
+  if(raw.startsWith('[Monitor]'))cls='info';
+  log(cls,raw);
+}
+function populateAp(raw){
+  // Match BSSID-first format: [Scan] AA:BB:CC:DD:EE:FF | chN | -XXdBm | SSID
+  var m=raw.match(/([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s*\|\s*ch(\d+)\s*\|\s*(-?\d+)dBm\s*\|\s*(.*)/);
+  if(!m)return;
+  var bssid=m[1].toUpperCase(), ch=m[2], rssi=m[3], ssid=(m[4]||'').trim();
+  apList.push({bssid:bssid,ssid:ssid,ch:ch});
+  var lbl='ch'+ch+' '+rssi+'dBm | '+bssid+' | '+ssid.substring(0,18);
+  ['apD','apE','apH','apS','apSQ','apAF'].forEach(function(id){
+    var s=el(id);if(!s)return;
+    var o=document.createElement('option');o.value=bssid;o.textContent=lbl;s.appendChild(o);
+  });
+}
+function send(cmd){
+  if(!cmd || !cmd.trim())return;
+  log('inp-ln','> '+cmd);
+  if(ws && ws.readyState===WebSocket.OPEN){
+    ws.send(cmd);
+  } else {
+    log('err','✖ Not connected to ESP32! Reconnecting...');
+    connect();
+  }
+}
+function sendRaw(){
+  var inp=el('cmdInput');
+  var cmd=inp.value.trim();
+  if(!cmd)return;
+  history.unshift(cmd);
+  histIdx=-1;
+  inp.value='';
+  send(cmd);
+}
+function runScan(){
+  apList=[];
+  ['apD','apE','apH','apS','apSQ','apAF'].forEach(function(id){
+    var s=el(id);if(!s)return;while(s.options.length>1)s.remove(1);
+  });
+  send('scan');
+}
+function startDeauth(){
+  var bssid=v('apD').trim();
+  if(!bssid){log('err','Select an AP first.');return;}
+  var ap=apList.find(function(x){return x.bssid===bssid;});
+  var ch=ap?ap.ch:'1';
+  var cli=v('dCli').trim()||'FF:FF:FF:FF:FF:FF';
+  send('deauth '+bssid+' '+ch+' '+cli);
+}
+function startEvil(){
+  var bssid=v('apE'),ssid=v('eSsid').trim();
+  if(!ssid&&bssid){var a=apList.find(function(x){return x.bssid===bssid;});if(a)ssid=a.ssid;}
+  if(!ssid){log('err','Enter or select an SSID.');return;}
+  send('eviltwin '+ssid);
+}
+function startHs(){
+  var bssid=v('apH').trim();
+  if(!bssid){log('err','Select an AP first.');return;}
+  var ap=apList.find(function(x){return x.bssid===bssid;});
+  var ch=ap?ap.ch:'1';
+  el('dlBtn').disabled=true;el('hsStatus').textContent='EAPOL: 0/4';
+  send('handshake '+bssid+' '+ch);
+}
+function startPS(){
+  var ip=v('psIp').trim();if(!ip){log('err','Enter target IP.');return;}
+  send('portscan '+ip+' '+v('psS')+' '+v('psE'));
+}
+function startSae(){
+  var bssid=v('apS').trim();
+  if(!bssid){log('err','Select an AP first.');return;}
+  var ap=apList.find(function(x){return x.bssid===bssid;});
+  var ch=ap?ap.ch:'1';
+  send('sae '+bssid+' '+ch);
+}
+function startSaQuery(){
+  var bssid=v('apSQ').trim();
+  if(!bssid){log('err','Select an AP first.');return;}
+  var ap=apList.find(function(x){return x.bssid===bssid;});
+  var ch=ap?ap.ch:'1';
+  send('saquery '+bssid+' '+ch);
+}
+function startAssocFlood(){
+  var bssid=v('apAF').trim();
+  if(!bssid){log('err','Select an AP first.');return;}
+  var ap=apList.find(function(x){return x.bssid===bssid;});
+  var ch=ap?ap.ch:'1';
+  send('assocflood '+bssid+' '+ch);
+}
+function buildPcap(){
+  try{
+    var b64='';for(var i=0;i<pcapTotal;i++)b64+=(pcapChunks[i]||'');
+    var bin=atob(b64),buf=new Uint8Array(bin.length);
+    for(var i=0;i<bin.length;i++)buf[i]=bin.charCodeAt(i);
+    var a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([buf],{type:'application/octet-stream'}));
+    a.download='handshake.cap';a.click();
+    log('hs','[PCAP] handshake.cap saved ('+bin.length+' bytes). Use: hashcat or aircrack-ng');
+  }catch(ex){log('err','PCAP error: '+ex);}
+}
+function log(cls,txt){
+  var t=el('terminal'),s=document.createElement('span');
+  s.className='ln '+cls;s.textContent=txt;t.appendChild(s);t.scrollTop=t.scrollHeight;
+}
+function setDot(on){
+  el('wsDot').className='wsd'+(on?' on':'');
+  el('wsLbl').textContent=on?'Connected':'Disconnected';
+  var row=document.querySelector('.cmd-row');
+  var inp=el('cmdInput');
+  if(on){
+    row.style.borderTopColor='';
+    inp.placeholder='Type a command and press Enter (e.g. scan, monitor start, deauth AA:BB:CC:DD:EE:FF)...';
+  } else {
+    row.style.borderTopColor='var(--red)';
+    inp.placeholder='⚠ Disconnected — waiting for ESP32...';
+  }
+}
+function setBadge(id,txt,on){var b=el(id);b.textContent=txt;b.className='badge'+(on?' on':'');}
+function clearTerm(){el('terminal').innerHTML='';}
+window.addEventListener('load',init);
+</script></body></html>
+)rawliteral";
+
+// ═══════════════════════════════════════════════════════════
+//  ISR-safe queue
+// ═══════════════════════════════════════════════════════════
+void IRAM_ATTR enqueueMsg(const char* msg) {
+  int next = (qTail + 1) % QUEUE_SIZE;
+  if (next == qHead) { queueOverflow = true; return; }
+  strncpy(msgQueue[qTail], msg, MSG_LEN - 1);
+  msgQueue[qTail][MSG_LEN - 1] = '\0';
+  qTail = next;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ESP-NOW receive (core v3.x signature)
+// ═══════════════════════════════════════════════════════════
+void OnDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len <= 0 || len >= MSG_LEN) return;
+  char buf[MSG_LEN];
+  memcpy(buf, data, len);
+  buf[len] = '\0';
+  enqueueMsg(buf);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  WebSocket event handler
+// ═══════════════════════════════════════════════════════════
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Client #%u connected\n", num);
+      wsServer.sendTXT(num, "[ESP1] Security Suite ready. ESP-NOW link to Node 2 active.");
+      break;
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client #%u disconnected\n", num);
+      break;
+    case WStype_TEXT: {
+      if (length == 0) return;
+      char cmd[MSG_LEN];
+      if (length >= MSG_LEN) length = MSG_LEN - 1;
+      memcpy(cmd, payload, length);
+      cmd[length] = '\0';
+      Serial.printf("[WS] → %s\n", cmd);
+      // Echo command back to browser immediately so user knows ESP1 got it
+      char echo[MSG_LEN + 16];
+      snprintf(echo, sizeof(echo), "[ESP1]→ %s", cmd);
+      wsServer.sendTXT(num, echo);
+      // Forward to ESP2 via ESP-NOW
+      esp_err_t r = esp_now_send(ESP2_MAC, (uint8_t*)cmd, strlen(cmd));
+      if (r != ESP_OK) {
+        char err[80];
+        snprintf(err, sizeof(err), "[ESP1] ERROR: ESP-NOW failed (err=%d) — check ESP2_MAC & channel", r);
+        wsServer.sendTXT(num, err);
+      }
+      break;
+    }
+    default: break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Setup
+// ═══════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n\n==== ESP32 Node 1 — Security Suite Gateway ====");
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+  Serial.printf("AP: %s | IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("FATAL: ESP-NOW init failed"); while(true) delay(1000);
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, ESP2_MAC, 6);
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx   = WIFI_IF_AP;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK)
+    Serial.println("ERROR: Failed to add ESP2 peer — check ESP2_MAC[]");
+  else
+    Serial.println("ESP-NOW peer (Node 2) registered.");
+
+  httpServer.on("/", HTTP_GET, []() {
+    httpServer.send(200, "text/html", HTML_PAGE);
+  });
+  httpServer.onNotFound([]() {
+    httpServer.sendHeader("Location", "/"); httpServer.send(302);
+  });
+  httpServer.begin();
+  Serial.println("HTTP server on port 80");
+
+  wsServer.begin();
+  wsServer.onEvent(onWsEvent);
+  Serial.println("WebSocket server on port 81");
+
+  Serial.printf("AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
+  Serial.println("Connect to Wi-Fi: " + String(AP_SSID) + " → http://192.168.4.1");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Loop
+// ═══════════════════════════════════════════════════════════
+void loop() {
+  wsServer.loop();
+  httpServer.handleClient();
+
+  while (qHead != qTail) {
+    wsServer.broadcastTXT(msgQueue[qHead]);
+    qHead = (qHead + 1) % QUEUE_SIZE;
+  }
+
+  if (queueOverflow) {
+    wsServer.broadcastTXT("[ESP1] Queue overflow — some messages dropped");
+    queueOverflow = false;
+  }
+}

