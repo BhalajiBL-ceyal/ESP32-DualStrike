@@ -12,7 +12,7 @@ Inspired by [risinek/esp32-wifi-penetration-tool](https://github.com/risinek/esp
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │  YOUR PHONE / LAPTOP                                          │
-│  Connected to "ESP32-PenTool" Wi-Fi                          │
+│  Connected to "ESP32-PenTool" Wi-Fi                           │
 │  Browser  http://192.168.4.1                                  │
 └──────────────────────┬────────────────────────────────────────┘
                        │  Wi-Fi (HTTP + WebSocket port 81)
@@ -20,25 +20,25 @@ Inspired by [risinek/esp32-wifi-penetration-tool](https://github.com/risinek/esp
 ┌──────────────────────────────────┐
 │         NODE 1 — ESP32           │
 │  Node1_Gateway/Node1_Gateway.ino │
-│  • Wi-Fi AP  "ESP32-PenTool"    │
-│  • HTTP server  (port 80) UI    │
-│  • WebSocket   (port 81) cmds   │
-│  • Sends cmds → Node2 ESP-NOW   │
-│  • Receives results ← Node2     │
+│  • Wi-Fi AP  "ESP32-PenTool"     │
+│  • HTTP server  (port 80) UI     │
+│  • WebSocket   (port 81) cmds    │
+│  • Sends cmds → Node2 ESP-NOW    │
+│  • Receives results ← Node2      │
 └─────────────────┬────────────────┘
                   │  ESP-NOW (802.11 management frames)
                   │  ≈ 250 m range, no AP connection needed
                   ▼
-┌──────────────────────────────────┐
-│         NODE 2 — ESP32           │
+┌─────────────────────────────────────────┐
+│         NODE 2 — ESP32                  │
 │Node2_AttackEngine/Node2_AttackEngine.ino│
-│  • Monitor / promiscuous mode   │
-│  • Deauth / SAE / SA-Query      │
-│  • Beacon Spam                  │
-│  • Evil Twin + Captive Portal   │
-│  • WPA Handshake / PMKID cap.   │
-│  • Port Scan / Wardriving       │
-└──────────────────────────────────┘
+│  • Monitor / promiscuous mode           │
+│  • Deauth / SAE / SA-Query              │
+│  • Beacon Spam                          │
+│  • Evil Twin + Captive Portal           │
+│  • WPA Handshake / PMKID cap.           │
+│  • Port Scan / Wardriving               │
+└─────────────────────────────────────────┘
 ```
 
 ---
@@ -86,8 +86,8 @@ Inspired by [risinek/esp32-wifi-penetration-tool](https://github.com/risinek/esp
 5. Note the **"My STA MAC:"** address printed at boot, e.g.:
    ```
    ╔══════════════════════════════════════════════╗
-   ║  My STA MAC: 78:21:84:E1:76:10              ║
-   ║  → Paste above into esp1.ino  ESP2_MAC[]    ║
+   ║  My STA MAC: 78:21:84:E1:76:10               ║
+   ║  → Paste above into esp1.ino  ESP2_MAC[]     ║
    ╚══════════════════════════════════════════════╝
    ```
 
@@ -167,3 +167,4 @@ aircrack-ng handshake.cap -w wordlist.txt
 > ⚠️ **For educational and authorised penetration testing ONLY.**  
 > Using these tools on networks you do not own or have **explicit written permission** to test is illegal in most jurisdictions and may result in criminal prosecution.  
 > The author accepts no liability for misuse.
+
