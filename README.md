@@ -41,6 +41,7 @@ Inspired by [risinek/esp32-wifi-penetration-tool](https://github.com/risinek/esp
 │  • Port Scan / Wardriving               │
 └─────────────────────────────────────────┘
 ```
+![esp32](https://github.com/user-attachments/assets/efb73a5b-ac39-406e-8d19-032a4d1c2a42)
 
 ---
 
@@ -61,6 +62,7 @@ Inspired by [risinek/esp32-wifi-penetration-tool](https://github.com/risinek/esp
 | **Wardriving** | Passive scan cycles ch1-13, logs all APs found |
 
 ---
+
 
 ## Setup (Step-by-Step)
 
@@ -168,5 +170,6 @@ aircrack-ng handshake.cap -w wordlist.txt
 > ⚠️ **For educational and authorised penetration testing ONLY.**  
 > Using these tools on networks you do not own or have **explicit written permission** to test is illegal in most jurisdictions and may result in criminal prosecution.  
 > The author accepts no liability for misuse.
+
 
 
